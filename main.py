@@ -1,4 +1,9 @@
-"""Telekinesis CV: camera -> landmarks -> gestures -> objects -> physics -> frame."""
+"""Telekinesis CV - Reality Manipulation.
+
+Touch a real object in the (mirrored) webcam image -> its silhouette highlights ->
+pinch to lift its extracted appearance -> move, throw, scale, rotate, hide, reset.
+The physical object never moves; only its appearance in the video does.
+"""
 import argparse
 from collections import deque
 import math
@@ -8,22 +13,621 @@ import time
 import cv2
 import numpy as np
 
-from hand_tracker import HandTracker, draw_landmarks, draw_pointer, draw_pinch_indicator
-from interaction import Interaction
-from physics import spawn_objects, step_physics, hit_test
+from hand_tracker import CONNECTIONS, HandTracker
+from manipulation import Group, Manipulator, Sprite, render_sprite
+from scene import (ObjectTracker, PersonSegmenter, Reconstruction, SceneMemory, bbox_of,
+                   feathered_alpha, make_inpainter)
+from segmentation import MODEL_DIR, Job, SegmentationWorker, iou
+from selection import Selector, hand_zone, negative_prompts
 
-WINDOW = "Telekinesis CV | Virtual crystals"
+WINDOW = "Telekinesis CV | Reality Manipulation"
+CYAN, GREEN, ORANGE, WHITE, GREY = (255, 220, 90), (120, 255, 140), (60, 170, 255), (235, 235, 235), (160, 160, 160)
 
 
+def text(frame, message, org, color=WHITE, scale=.42, thickness=1):
+    for t, shade in ((thickness + 2, (0, 0, 0)), (thickness, color)):
+        cv2.putText(frame, message, org, cv2.FONT_HERSHEY_SIMPLEX, scale, shade, t, cv2.LINE_AA)
+
+
+def ipt(p):
+    return tuple(int(v) for v in np.rint(p))
+
+
+def shifted(mask, offset):
+    """Translate a bool mask by an integer pixel offset (no wrap-around)."""
+    dx, dy = (int(v) for v in np.rint(offset))
+    if dx == 0 and dy == 0:
+        return mask
+    out = np.zeros_like(mask)
+    h, w = mask.shape
+    out[max(0, dy):h + min(0, dy), max(0, dx):w + min(0, dx)] = \
+        mask[max(0, -dy):h - max(0, dy), max(0, -dx):w - max(0, dx)]
+    return out
+
+
+class App:
+    """All per-frame logic. `step()` is pure w.r.t. I/O, so tests can drive it."""
+
+    def __init__(self, width, height, worker, args):
+        self.width, self.height = width, height
+        self.worker = worker
+        self.args = args
+        self.selector = Selector()
+        self.manip = Manipulator(width, height, args.pinch_threshold, args.release_threshold,
+                                 args.min_scale, args.max_scale)
+        self.memory = SceneMemory()
+        self.inpainter = make_inpainter()
+        self.snapshots = {}            # snapshot id -> hand pixels (person seg within hand zone)
+        self.pending_lock = None       # (slot, deadline) pinch arrived before the mask did
+        self.refining = None           # (group id, snapshot id, submitted time)
+        self.refine_counter = 10 ** 6  # refine jobs use their own id range
+        self.debug = args.debug
+        self.occlusion = "hands"
+        self.show_keys = True
+        self.messages = deque(maxlen=3)
+        self.mouse = {"point": None, "down": False, "moved": -10.0}
+        self.pointer_slot = None
+        self.last_candidate = None
+        self.counters = dict(previews=0, locks=0, rejected_stale=0, refine_accepted=0,
+                             refine_rejected=0)
+        self.started = None
+        self.next_group = 0            # unique ids: refinement results find the right object
+
+    # ------------------------------------------------------------------ helpers
+    def say(self, message, now, seconds=2.0):
+        self.messages.append((message, now + seconds))
+        print(f"[{now:7.2f}s] {message}", flush=True)
+
+    def active(self):
+        return self.manip.object(self.manip.active) if self.manip.active is not None else None
+
+    def groups(self):
+        seen = {}
+        for obj in self.manip.objects:
+            seen.setdefault(obj.group.id, obj.group)
+        return list(seen.values())
+
+    def blocked(self, x, y):
+        for group in self.groups():
+            ox, oy = (int(v) for v in np.rint(group.tracker.offset))
+            yy, xx = y - oy, x - ox
+            if 0 <= yy < self.height and 0 <= xx < self.width and group.reconstruction.hole[yy, xx]:
+                return True
+        return self.manip.hit((x, y)) is not None
+
+    def choose_pointer(self, now):
+        hands = self.manip.hands
+        if any(h.held is not None for h in hands):
+            return None                # while holding, a 2nd-hand pinch means scale/rotate
+        if self.mouse["point"] is not None and now - self.mouse["moved"] < 1.5 and hands[2].held is None:
+            return 2
+        eligible = [s for s in (0, 1) if hands[s].present and hands[s].held is None]
+        if self.pointer_slot in eligible:
+            return self.pointer_slot
+        return eligible[0] if eligible else None
+
+    # ------------------------------------------------------------------ main step
+    def person(self):
+        """Person-probability mask for the current frame, computed only when needed."""
+        if self._person is None:
+            source = self._person_source
+            value = source() if callable(source) else source
+            self._person = np.zeros(self._shape, np.float32) if value is None else value
+        return self._person
+
+    def step(self, frame, now, dt, observations, person=None):
+        """frame: mirrored BGR camera image; observations: MediaPipe hands (mirrored px);
+        person: float person-probability mask, a zero-argument callable producing it
+        lazily, or None. Returns the composited display."""
+        if self.started is None:
+            self.started = now
+        h, w = frame.shape[:2]
+        self._shape, self._person_source, self._person = (h, w), person, None
+        if dt > .25:
+            self.selector.reset_dwell(now)
+        mouse = self.mouse if self.mouse["point"] is not None else None
+        events = self.manip.update_hands(observations, now, dt, mouse)
+        hands = self.manip.hands
+        hand_points = [hands[s].points for s in (0, 1) if hands[s].present]
+        zone = hand_zone((h, w), hand_points)
+        self.last_frame, self.last_zone = frame, zone
+        if self.manip.objects or self.debug:
+            person = self.person()     # occlusion, reconstruction and tracking need it
+        if now >= self.memory.next_at:
+            # Remember where people/hands were, so memory never offers a hand as background.
+            seen = zone.astype(np.float32) if self._person is None else np.maximum(self._person, zone)
+            self.memory.observe(frame, seen, now)
+
+        # 1) Selection: aim -> (snapshot + segmentation in the background) -> preview.
+        self.pointer_slot = self.choose_pointer(now)
+        pointer = hands[self.pointer_slot] if self.pointer_slot is not None else None
+        aim = None if pointer is None else pointer.aim
+        engaged = pointer is not None and pointer.pinch.engaged
+        hovering = None if aim is None else self.manip.hit(aim)
+        negatives = [p for pts in hand_points for p in negative_prompts(pts)]
+        job = None
+        if self.worker.ready or self.worker.model is not None:
+            job = self.selector.update(now, None if hovering else aim, frame, hand_points,
+                                       zone, self.blocked, engaged, negatives=negatives)
+        if job is not None:
+            job.max_area = self.args.max_area
+            if job.frame is not None:
+                # Real hand pixels in THIS snapshot, later removed from the cut-out; the
+                # person mask also stops the user's own body being chosen as the object.
+                job.person = self.person() > .5
+                self.snapshots[job.snapshot_id] = job.person & zone
+                for old in [k for k in self.snapshots if k < job.snapshot_id - 3]:
+                    self.snapshots.pop(old)
+            self.worker.request(job)
+
+        polled = self.worker.poll()
+        if polled is not None:
+            kind, result = polled
+            if kind == "select":
+                if self.selector.accept(result, now):
+                    self.counters["previews"] += 1
+                    c = self.selector.candidate
+                    if c is not None:
+                        print(f"[{now:7.2f}s] preview: {len(result.candidates)} candidates, chose "
+                              f"area {c.area:.3f} score {c.score:.2f} stability {c.stability:.2f}; "
+                              f"encoder {result.encoder_ms:.0f} ms decoder {result.decoder_ms:.0f} ms",
+                              flush=True)
+                else:
+                    self.counters["rejected_stale"] += 1
+            elif kind == "refine":
+                self.finish_refine(result, now)
+
+        # 2) Gesture events.
+        for slot, event in events:
+            self.handle(slot, event, now)
+        if self.pending_lock is not None:
+            slot, deadline = self.pending_lock
+            hand = hands[slot]
+            if not hand.pinch.pinched or now > deadline:
+                self.pending_lock = None
+                self.say("Pinch cancelled - no outline was ready. Hold still, then pinch.", now)
+            elif self.selector.candidate is not None:
+                self.pending_lock = None
+                self.lock(slot, now)
+
+        # 3) Track the physical originals; refine the cut-out once the hand is away.
+        if self.groups():
+            person = self.person()
+            occluder = (person > .5) | zone
+            for group in self.groups():
+                group.tracker.update(frame, occluder, now)
+            self.schedule_refine(frame, zone, (person > .5) & zone, now)
+        self.manip.update_objects(now, dt)
+        person = self.person() if self.manip.objects or self.debug else None
+
+        # 4) Composite: live -> reconstructed originals -> sprites -> hands in front.
+        out = frame.copy()
+        for group in self.groups():
+            group.reconstruction.render(out, frame, group.tracker.offset, person)
+        dirty = []
+        for obj in self.manip.draw_order():
+            glow = GREEN if obj.holders else None
+            rect = render_sprite(out, obj, glow)
+            if rect:
+                dirty.append(rect)
+        if self.occlusion != "off" and dirty:
+            if self.occlusion == "hands":
+                soft_zone = cv2.GaussianBlur(zone.astype(np.float32), (15, 15), 0)
+                fg = person * soft_zone
+            else:
+                fg = person
+            for x0, y0, x1, y1 in dirty:
+                a = fg[y0:y1, x0:x1, None]
+                out[y0:y1, x0:x1] = (out[y0:y1, x0:x1] * (1 - a) + frame[y0:y1, x0:x1] * a).astype(np.uint8)
+        self.draw_feedback(out, frame, now, aim, hovering, person, zone)
+        return out
+
+    # ------------------------------------------------------------------ events
+    def handle(self, slot, event, now):
+        m = self.manip
+        hand = m.hands[slot]
+        if event == "press":
+            target = m.hit(hand.pinch_point) or m.hit(hand.aim)
+            other = next((m.object(m.hands[s].held) for s in (0, 1, 2)
+                          if s != slot and m.hands[s].held is not None), None)
+            if target is not None:
+                m.grab(slot, target, now)
+                self.say("Two hands: spread = scale, turn = rotate" if len(target.holders) > 1
+                         else "Grabbed - move it; release to place, flick to throw", now)
+            elif other is not None and slot != 2:
+                m.grab(slot, other, now)
+                self.say("Two hands: spread = scale, turn = rotate", now)
+            elif slot == self.pointer_slot and self.selector.candidate is not None:
+                self.lock(slot, now)
+            elif slot == self.pointer_slot and self.selector.state == "ANALYZING":
+                self.pending_lock = (slot, now + 2.0)
+        elif event == "release":
+            if self.pending_lock and self.pending_lock[0] == slot:
+                self.pending_lock = None
+            outcome = m.release(slot, now)
+            if outcome == "throw":
+                self.say("Thrown!", now, 1.2)
+            elif outcome == "drop":
+                self.say("Placed - it floats there. Pinch it to grab again.", now)
+        elif event == "lost" and slot != 2:
+            self.say("Hand lost - object stays where it was (no throw)", now)
+        elif event == "fist":
+            other = next((m.object(m.hands[s].held) for s in (0, 1) if s != slot
+                          and m.hands[s].held is not None), None)
+            if other is not None:
+                copy = m.duplicate(other)
+                self.say("Duplicated (experimental)" if copy else "Object limit reached", now)
+            elif self.active() is not None:
+                self.say(f"Object {m.toggle_visibility(self.active())}", now)
+        elif event == "palm":
+            obj = self.active()
+            if obj is not None and not any(o.holders for o in m.objects):
+                m.reset(obj)
+                self.say("Reset to original position, scale, rotation", now)
+
+    # ------------------------------------------------------------------ lock / extract
+    def lock(self, slot, now):
+        result, candidate = self.selector.result, self.selector.candidate
+        embedding = result.embedding
+        snap = embedding.frame
+        mask = candidate.mask.copy()
+        hand_pixels = self.snapshots.get(result.snapshot_id)
+        if hand_pixels is not None:
+            trimmed = mask & ~cv2.dilate(hand_pixels.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool)
+            if trimmed.sum() >= .4 * mask.sum():
+                mask = trimmed         # exclude the selecting hand's pixels from the cut-out
+        for group in self.groups():
+            if iou(mask, shifted(group.mask, group.tracker.offset)) > .5:
+                self.say("That object is already extracted - pinch its image instead", now)
+                self.selector.clear()
+                return
+        self.next_group += 1
+        group, sprite = self.extract(snap, mask, now, self.next_group)
+        group.snapshot_id = result.snapshot_id
+        group.score, group.stability = candidate.score, candidate.stability
+        obj = self.manip.add(group, sprite)
+        self.manip.grab(slot, obj, now)
+        self.last_candidate = (mask, candidate)
+        self.counters["locks"] += 1
+        self.selector.clear()
+        self.say(f"Locked ({group.reconstruction.source}). Move it; release to place, flick to throw", now, 3)
+
+    def extract(self, frame, mask, now, gid):
+        """Build the RGBA sprite + tracker + background reconstruction for one object."""
+        box = bbox_of(mask, margin=3)
+        x0, y0, x1, y1 = box
+        ys, xs = np.nonzero(mask)
+        centroid = np.array([xs.mean(), ys.mean()])
+        sprite = Sprite(frame[y0:y1, x0:x1].copy(), feathered_alpha(mask)[y0:y1, x0:x1],
+                        centroid - (x0, y0))
+        tracker = ObjectTracker(frame, mask)
+        reconstruction = Reconstruction(frame, mask, self.memory, now, self.inpainter)
+        return Group(gid, mask, centroid, tracker, reconstruction), sprite
+
+    def schedule_refine(self, frame, zone, hand_pixels, now):
+        """Re-segment once the hand has left the original region: a hand-free view
+        gives a complete silhouette (no finger notch) and clean pixels."""
+        if self.refining is not None:
+            if now - self.refining[2] > 6:
+                self.refining = None           # replaced/lost in the one-slot queue
+            return
+        if self.worker.busy or self.selector.state == "ANALYZING":
+            return
+        for group in self.groups():
+            if group.refined:
+                continue
+            region = shifted(group.reconstruction.hole, group.tracker.offset)
+            region = cv2.dilate(region.astype(np.uint8), np.ones((31, 31), np.uint8)).astype(bool)
+            clear = not (region & zone).any() and group.tracker.state == "TRACKING"
+            if not clear:
+                group.clear_since = None
+                continue
+            if group.clear_since is None:
+                group.clear_since = now
+            if now - group.clear_since < .4:
+                continue
+            x0, y0, x1, y1 = bbox_of(shifted(group.mask, group.tracker.offset), margin=6)
+            self.refine_counter += 1
+            job = Job("refine", self.refine_counter, self.refine_counter, frame=frame,
+                      positives=(tuple(group.origin + group.tracker.offset),), box=(x0, y0, x1, y1),
+                      hand_points=(), hand_zone=zone, captured_at=now, max_area=1.0)
+            self.snapshots[self.refine_counter] = hand_pixels.copy()
+            self.refining = (group.id, self.refine_counter, now, group.tracker.offset.copy())
+            group.refine = "re-segmenting from a hand-free view..."
+            self.worker.request(job)
+            return
+
+    def finish_refine(self, result, now):
+        if self.refining is None or result.snapshot_id != self.refining[1]:
+            return
+        gid, submit_offset = self.refining[0], self.refining[3]
+        self.refining = None
+        group = next((g for g in self.groups() if g.id == gid), None)
+        if group is None:
+            return
+        if group.tracker.state != "TRACKING":
+            # The scene may have changed while the model ran; re-anchoring to that frame
+            # could be wrong. Skip now; it is retried once tracking is confident again.
+            group.refine = "refinement skipped (tracking not confident); will retry"
+            group.clear_since = None
+            return
+        group.refined = True
+        # Compare in the coordinates of the frame that was re-segmented.
+        old = shifted(group.mask, submit_offset)
+        best, best_iou = None, 0.0
+        for c in result.candidates:
+            value = iou(c.mask, old)
+            if value > best_iou:
+                best, best_iou = c, value
+        ratio = best.mask.sum() / max(old.sum(), 1) if best is not None else 0
+        if best is None or best_iou < .5 or not .6 <= ratio <= 1.8:
+            # Never silently switch objects: disagreement keeps the original cut-out.
+            group.refine = f"kept original (refinement IoU {best_iou:.2f})"
+            self.counters["refine_rejected"] += 1
+            return
+        mask = best.mask
+        hand_pixels = self.snapshots.pop(result.snapshot_id, None)
+        if hand_pixels is not None:
+            mask = mask & ~hand_pixels
+        new_group, sprite = self.extract(result.embedding.frame, mask, now, group.id)
+        group.mask, group.origin = new_group.mask, new_group.origin
+        group.tracker, group.reconstruction = new_group.tracker, new_group.reconstruction
+        group.refine = f"refined from hand-free view (IoU {best_iou:.2f})"
+        for obj in self.manip.objects:
+            if obj.group is group:
+                obj.sprite = sprite
+        self.counters["refine_accepted"] += 1
+        print(f"[{now:7.2f}s] refinement accepted, IoU {best_iou:.2f}, "
+              f"background: {group.reconstruction.source}", flush=True)
+
+    # ------------------------------------------------------------------ keyboard / mouse
+    def key(self, key, now):
+        obj = self.active()
+        m = self.manip
+        if key == 27 and obj is not None:                       # Esc
+            m.remove(obj)
+            self.say("Released back to reality (original shown again)", now)
+        elif key in (ord("r"), ord("R")) and obj is not None:
+            m.reset(obj)
+            self.say("Reset", now)
+        elif key in (ord("h"), ord("H")) and obj is not None:
+            self.say(f"Object {m.toggle_visibility(obj)}", now)
+        elif key in (ord("c"), ord("C")) and obj is not None:
+            self.say("Duplicated (experimental)" if m.duplicate(obj) else "Object limit reached", now)
+        elif key in (ord("z"), ord("Z")) and obj is not None:
+            outcome = m.toggle_freeze(obj)
+            if outcome:
+                self.say(outcome.capitalize(), now)
+        elif key in (ord("m"), ord("M")):
+            self.selector.cycle(now)
+        elif key in (ord("b"), ord("B")) and obj is not None:
+            self.say(f"Background: {obj.group.reconstruction.cycle()}", now)
+        elif key in (ord("p"), ord("P")):
+            seen = np.maximum(self.person(), self.last_zone.astype(np.float32))
+            self.memory.capture_plate(self.last_frame, seen, now)
+            self.say("Clean plate captured - valid only if the objects were physically removed", now, 3)
+        elif key in (ord("o"), ord("O")):
+            self.occlusion = {"hands": "person", "person": "off", "off": "hands"}[self.occlusion]
+            self.say(f"Occlusion: {self.occlusion} in front of objects", now)
+        elif key in (ord("t"), ord("T")):
+            m.roll_rotation = not m.roll_rotation
+            self.say(f"One-hand twist rotation {'on' if m.roll_rotation else 'off'}", now)
+        elif key in (ord("d"), ord("D")):
+            self.debug = not self.debug
+        elif key in (ord("k"), ord("K")):
+            self.show_keys = not self.show_keys
+        elif key == 9 and m.objects:                            # Tab
+            ids = [o.id for o in m.objects]
+            m.active = ids[(ids.index(m.active) + 1) % len(ids)] if m.active in ids else ids[0]
+        elif key in (ord("x"), ord("X")):
+            for o in list(m.objects):
+                m.remove(o)
+            self.say("All objects released", now)
+        elif key in (ord("e"), ord("E")) and self.worker.error:
+            self.worker.retry()
+            self.say("Retrying segmentation", now)
+
+    def on_mouse(self, event, x, y, flags, _param=None):
+        now = time.perf_counter() - (self.started_wall or 0)
+        x, y = min(max(x, 0), self.width - 1), min(max(y, 0), self.height - 1)
+        if event == cv2.EVENT_MOUSEMOVE:
+            self.mouse.update(point=(x, y), moved=now)
+        elif event == cv2.EVENT_LBUTTONDOWN:
+            self.mouse.update(point=(x, y), down=True, moved=now)
+        elif event == cv2.EVENT_LBUTTONUP:
+            self.mouse.update(point=(x, y), down=False, moved=now)
+        elif event == cv2.EVENT_RBUTTONDOWN:
+            self.selector.cycle(now)
+        elif event == cv2.EVENT_MOUSEWHEEL and self.active() is not None:
+            obj = self.active()
+            up = cv2.getMouseWheelDelta(flags) > 0
+            if flags & cv2.EVENT_FLAG_CTRLKEY:
+                obj.angle += 10 if up else -10
+            else:
+                obj.scale = float(np.clip(obj.scale * (1.1 if up else 1 / 1.1),
+                                          self.manip.min_scale, self.manip.max_scale))
+            if obj.mode == "home":
+                obj.mode = "floating"
+
+    started_wall = None
+    last_frame = last_zone = None
+
+    # ------------------------------------------------------------------ drawing
+    def draw_feedback(self, out, frame, now, aim, hovering, person, zone):
+        s = self.selector
+        m = self.manip
+        # Candidate preview: thin outline + faint tint = TARGETED.
+        mask = s.mask
+        if mask is not None:
+            tint = out[mask].astype(np.float32) * .78 + np.array(CYAN, np.float32) * .22
+            out[mask] = tint.astype(np.uint8)
+            contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(out, contours, -1, CYAN, 1, cv2.LINE_AA)
+        if hovering is not None and not hovering.holders:
+            cv2.circle(out, ipt(hovering.position), 5, GREEN, 1, cv2.LINE_AA)
+        # Reticle at the aim point; an arc shows dwell/analysis progress.
+        if aim is not None:
+            centre = ipt(aim)
+            colour = CYAN if s.state == "PREVIEW" else WHITE
+            cv2.circle(out, centre, 7, (20, 20, 20), 3, cv2.LINE_AA)
+            cv2.circle(out, centre, 7, colour, 1, cv2.LINE_AA)
+            if s.state == "AIMING" and s.anchor_since is not None:
+                p = min(1.0, (now - s.anchor_since) / s.dwell)
+                cv2.ellipse(out, centre, (12, 12), -90, 0, 360 * p, WHITE, 2, cv2.LINE_AA)
+            elif s.state == "ANALYZING":
+                start = (now * 360) % 360
+                cv2.ellipse(out, centre, (12, 12), start, 0, 90, CYAN, 2, cv2.LINE_AA)
+        # Held objects: tether from fingers; transform indicators while two-handed.
+        for slot, hand in enumerate(m.hands):
+            if hand.held is None:
+                continue
+            obj = m.object(hand.held)
+            if obj is None:
+                continue
+            cv2.line(out, ipt(hand.pinch_point), ipt(obj.position), GREEN, 1, cv2.LINE_AA)
+            cv2.circle(out, ipt(hand.pinch_point), 4, GREEN, -1, cv2.LINE_AA)
+            if len(obj.holders) > 1:
+                text(out, f"x{obj.scale:.2f}  {obj.angle:+.0f} deg", ipt(obj.position + (-40, -obj.half_extent()[1] - 8)), GREEN, .45)
+            elif abs(obj.angle) >= 1:
+                text(out, f"{obj.angle:+.0f} deg", ipt(obj.position + (-18, -obj.half_extent()[1] - 8)), GREEN, .4)
+        # Fist / palm hold progress rings (so an action never happens by surprise).
+        for hand in m.hands[:2]:
+            if not hand.present:
+                continue
+            for gesture, colour, label in ((hand.fist, ORANGE, "hide/show"), (hand.palm, CYAN, "reset")):
+                p = gesture.progress(now)
+                if p > .15 and m.objects:
+                    c = ipt(hand.palm_center)
+                    cv2.ellipse(out, c, (26, 26), -90, 0, 360 * p, colour, 3, cv2.LINE_AA)
+                    text(out, label, (c[0] - 28, c[1] + 42), colour, .4)
+        # Status: one line of "what to do next", plus short-lived event messages.
+        text(out, self.status(now), (10, 22), WHITE, .5)
+        y = 44
+        for message, until in list(self.messages):
+            if now < until:
+                text(out, message, (10, y), CYAN, .45)
+                y += 20
+        hidden = sum(1 for o in m.objects if not o.visible)
+        lost = [g for g in self.groups() if g.tracker.state.startswith("LOST")]
+        if hidden:
+            text(out, f"{hidden} hidden (H / fist to show)", (w_right(out, 210), 22), GREY, .42)
+        if lost:
+            text(out, "tracking lost: original held at last position", (10, out.shape[0] - 48), ORANGE, .42)
+        if self.show_keys and not self.debug:
+            text(out, "Esc release  R reset  H hide  C duplicate  Z freeze  M other outline  B background  "
+                      "P clean plate  O occlusion  D debug  K keys  Q quit", (10, out.shape[0] - 10), GREY, .34)
+        if self.debug:
+            self.draw_debug(out, now, aim, person, zone)
+
+    def status(self, now):
+        s, m = self.selector, self.manip
+        if self.worker.error:
+            return "Segmentation unavailable - see console (E retries). Hand tracking still runs."
+        if not self.worker.ready and self.worker.model is None:
+            return "Loading the segmentation model..."
+        held = [o for o in m.objects if o.holders]
+        if held:
+            if len(held[0].holders) > 1:
+                return "Spread / close hands to scale - turn them to rotate"
+            return "Move it - release to place - flick + release to throw - 2nd hand pinch: scale"
+        if self.pending_lock:
+            return "Keep pinching - finding the object..."
+        if s.state == "PREVIEW":
+            return "Pinch to grab this object   (M / right-click: other outline)"
+        if s.state == "ANALYZING":
+            return "Finding the object..."
+        if s.state == "AIMING":
+            return "Hold still on the object..."
+        if s.state == "NO_OBJECT":
+            return "No clear object there - try touching its centre"
+        if not any(h.present for h in m.hands[:2]) and self.pointer_slot != 2:
+            return "Raise a hand and touch a real object in the image with your fingertip"
+        if m.objects:
+            return "Pinch an object to grab - fist 0.6s: hide/show - open palm 1.5s: reset"
+        return "Touch a real object in the image with your fingertip"
+
+    def draw_debug(self, out, now, aim, person, zone):
+        m, s = self.manip, self.selector
+        lines = [f"FPS {self.fps:.1f}   frame {self.frame_ms:.0f} ms (hands{'x2' if self.two_hand_mode else ''} {self.hands_ms:.0f}, "
+                 f"person {self.person_ms:.0f}, app {self.app_ms:.0f})",
+                 f"model: encoder {self.worker.last_encoder_ms:.0f} ms decoder {self.worker.last_decoder_ms:.0f} ms"
+                 f"   aim->preview {s.latency_ms or 0:.0f} ms   busy {self.worker.busy}",
+                 f"selection {s.state}  snapshot {s.snapshot_id} prompt {s.prompt_id}  stale rejected "
+                 f"{self.counters['rejected_stale']}"]
+        if s.result is not None:
+            for i, c in enumerate(s.result.candidates):
+                mark = ">" if i == s.choice else " "
+                lines.append(f" {mark}{i} area {c.area:.3f} score {c.score:.2f} stab {c.stability:.2f} "
+                             f"hand {c.hand_overlap:.2f} body {c.person_overlap:.2f} {c.rank_reason}")
+        for slot, hand in enumerate(m.hands):
+            if hand.present:
+                ratio = "--" if hand.ratio is None else f"{hand.ratio:.2f}"
+                lines.append(f"hand{slot}{'(mouse)' if hand.virtual else ''}: pinch {ratio} {hand.pinch.state} "
+                             f"v=({hand.velocity[0]:.0f},{hand.velocity[1]:.0f}) roll {hand.roll:.0f} "
+                             f"tip {ipt(hand.pinch_point)} held {hand.held}")
+        for obj in m.objects:
+            g = obj.group
+            lines.append(f"obj{obj.id}{'*' if obj.id == m.active else ''}{' dup' if obj.duplicate else ''}: "
+                         f"{obj.mode} pos {ipt(obj.position)} x{obj.scale:.2f} {obj.angle:+.0f}deg "
+                         f"v=({obj.velocity[0]:.0f},{obj.velocity[1]:.0f}) vis {obj.visible}")
+            lines.append(f"   track {g.tracker.state} ncc {g.tracker.score:.2f} occl {g.tracker.occluded_fraction:.2f} "
+                         f"off {ipt(g.tracker.offset)} | bg: {g.reconstruction.source} | {g.refine}")
+        y = 112                        # below the status line and event messages
+        for line in lines:
+            text(out, line, (10, y), (200, 255, 200), .36)
+            y += 15
+        for slot, hand in enumerate(m.hands[:2]):
+            if hand.present:
+                pts = np.rint(hand.points).astype(int)
+                for a, b in CONNECTIONS:
+                    cv2.line(out, tuple(pts[a]), tuple(pts[b]), (140, 230, 150), 1, cv2.LINE_AA)
+                for p in pts:
+                    cv2.circle(out, tuple(p), 2, WHITE, -1, cv2.LINE_AA)
+                cv2.circle(out, tuple(pts[8]), 4, (0, 255, 255), -1, cv2.LINE_AA)
+                for p in negative_prompts(hand.points):
+                    cv2.drawMarker(out, ipt(p), (60, 60, 255), cv2.MARKER_TILTED_CROSS, 8, 1)
+        if s.result is not None and s.result.point is not None:
+            cv2.drawMarker(out, ipt(s.result.point), (0, 255, 0), cv2.MARKER_CROSS, 12, 2)
+        # Thumbnails: raw binary mask, person segmentation, active sprite alpha.
+        th, tw = 90, 120
+        y0 = out.shape[0] - th - 24
+        thumbs = []
+        raw = s.mask if s.mask is not None else (self.last_candidate[0] if self.last_candidate else None)
+        if raw is not None:
+            thumbs.append(("binary mask", raw.astype(np.uint8) * 255))
+        thumbs.append(("person seg", (person * 255).astype(np.uint8)))
+        thumbs.append(("hand zone", zone.astype(np.uint8) * 255))
+        obj = self.active()
+        if obj is not None:
+            thumbs.append(("sprite alpha", (obj.sprite.alpha * 255).astype(np.uint8)))
+        for i, (label, image) in enumerate(thumbs):
+            x0 = 10 + i * (tw + 8)
+            if x0 + tw > out.shape[1]:
+                break
+            out[y0:y0 + th, x0:x0 + tw] = cv2.cvtColor(cv2.resize(image, (tw, th), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2BGR)
+            text(out, label, (x0, y0 - 4), WHITE, .33)
+
+    fps = frame_ms = hands_ms = person_ms = app_ms = 0.0
+    two_hand_mode = False
+    _person = _person_source = None
+    _shape = None
+
+    def close(self):
+        self.inpainter.shutdown(wait=False, cancel_futures=True)
+
+
+def w_right(frame, width):
+    return frame.shape[1] - width
+
+
+# ---------------------------------------------------------------------- camera loop
 def create_window(width, height):
-    # Enlarge only the display: inference still runs on the original camera
-    # frame, so a bigger window doesn't add landmark-model work.
+    # Enlarge only the display; inference keeps using the 640x480 camera frame.
     scale = 2.0
     if sys.platform == "win32":
         import ctypes
         screen = ctypes.windll.user32
-        scale = min(scale, screen.GetSystemMetrics(0) * 0.90 / width,
-                    screen.GetSystemMetrics(1) * 0.85 / height)
+        scale = min(scale, screen.GetSystemMetrics(0) * .92 / width, screen.GetSystemMetrics(1) * .86 / height)
     size = (int(width * scale), int(height * scale))
     cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
     cv2.resizeWindow(WINDOW, *size)
@@ -33,8 +637,7 @@ def create_window(width, height):
 def open_camera(index, backend):
     choices = {"dshow": cv2.CAP_DSHOW, "msmf": cv2.CAP_MSMF}
     backends = ([choices[backend]] if backend != "auto" else
-                [cv2.CAP_DSHOW, cv2.CAP_MSMF] if sys.platform == "win32" else
-                [cv2.CAP_ANY])
+                [cv2.CAP_DSHOW, cv2.CAP_MSMF] if sys.platform == "win32" else [cv2.CAP_ANY])
     for api in backends:
         camera = cv2.VideoCapture(index, api)
         if camera.isOpened():
@@ -45,193 +648,105 @@ def open_camera(index, backend):
             for _ in range(10):
                 ok, frame = camera.read()
                 if ok and frame is not None and frame.size:
-                    print(f"Camera {index}: {camera.getBackendName()}, "
-                          f"{frame.shape[1]}x{frame.shape[0]}", flush=True)
+                    print(f"Camera {index}: {camera.getBackendName()}, {frame.shape[1]}x{frame.shape[0]}", flush=True)
                     return camera, frame
         camera.release()
     raise RuntimeError(
-        f"Cannot read webcam {index}. Close other camera apps, check the shutter "
-        "and Windows Settings > Privacy & security > Camera > Let desktop apps "
-        "access your camera. Try --camera 1 or --backend msmf."
-    )
-
-
-def text(frame, message, y, color=(235, 235, 235), x=12, scale=0.46):
-    for thickness, shade in ((3, (0, 0, 0)), (1, color)):
-        cv2.putText(frame, message, (x, y), cv2.FONT_HERSHEY_SIMPLEX,
-                    scale, shade, thickness, cv2.LINE_AA)
-
-
-def pixel(point):
-    return tuple(np.rint(point).astype(int))
-
-
-def draw_scene(frame, game, now, fps, debug=False, landmarks=True, inference_ms=0, dt=0):
-    targets = {hit_test(game.objects, h.pointer) for h in game.hands if h.pointer is not None}
-    cv2.line(frame, (0, game.height), (game.width - 1, game.height), (120, 130, 140), 1)
-    for i, obj in enumerate(game.objects):
-        color = obj.color
-        if np.linalg.norm(obj.velocity) > 100:
-            trail = list(obj.trail)
-            for j in range(1, len(trail)):
-                shade = tuple(int(c * j / len(trail) * 0.65) for c in color)
-                cv2.line(frame, pixel(trail[j - 1]), pixel(trail[j]), shade, 2, cv2.LINE_AA)
-        center = pixel(obj.position)
-        if obj.holders or i in targets:
-            cv2.circle(frame, center, int(obj.radius + 7), color,
-                       3 if obj.holders else 1, cv2.LINE_AA)
-        # Polygon crystals use circular collision bounds. Facets and a bright
-        # vertex make two-hand rotation visible even on symmetric shapes.
-        angles = obj.angle + np.arange(obj.sides) * (2 * math.pi / obj.sides)
-        vertices = np.rint(obj.position + obj.radius * np.column_stack(
-            (np.cos(angles), np.sin(angles)))).astype(np.int32)
-        cv2.fillConvexPoly(frame, vertices, tuple(int(c * 0.18) for c in color), cv2.LINE_AA)
-        cv2.polylines(frame, [vertices], True, color, 2, cv2.LINE_AA)
-        for vertex in vertices:
-            cv2.line(frame, center, tuple(vertex), tuple(int(c * 0.55) for c in color), 1, cv2.LINE_AA)
-        cv2.circle(frame, tuple(vertices[0]), 4, (250, 250, 250), -1, cv2.LINE_AA)
-        if obj.frozen:
-            text(frame, "LOCK", center[1] + 5, x=center[0] - 18, scale=0.40)
-        if debug:
-            cv2.circle(frame, center, int(obj.radius), (130, 130, 130), 1)
-            text(frame, f"{i + 1}: {np.linalg.norm(obj.velocity):.0f}px/s",
-                 center[1] - int(obj.radius) - 10, x=max(2, center[0] - 35), scale=0.35)
-
-    for slot, hand in enumerate(game.hands):
-        if hand.points is None:
-            continue
-        if landmarks:
-            draw_landmarks(frame, hand.points, debug)
-        draw_pointer(frame, hand.pointer, hand.points[8], debug)
-        state = ("PINCHED" if hand.pinched else "APPROACHING"
-                 if hand.ratio is not None and hand.ratio < game.release_threshold + 0.20 else "OPEN")
-        draw_pinch_indicator(frame, (22 + 180 * slot, 49), state)
-        ratio = f"{hand.ratio:.2f}" if hand.ratio is not None else "--"
-        text(frame, f"{state} {ratio}", 54, x=38 + 180 * slot, scale=0.40)
-        if hand.held is not None:
-            obj = game.objects[hand.held]
-            cv2.line(frame, pixel(hand.pointer), pixel(obj.position), obj.color, 2, cv2.LINE_AA)
-        if debug:
-            end = hand.pointer + hand.velocity * 0.10
-            cv2.arrowedLine(frame, pixel(hand.pointer), pixel(end), (90, 200, 255), 2,
-                           cv2.LINE_AA, tipLength=0.2)
-            y = 130 + slot * 66
-            text(frame, f"H{slot + 1} index {hand.points[8].round(1)} thumb {hand.points[4].round(1)}",
-                 y, scale=0.38)
-            text(frame, f"v {hand.velocity.round(0)} px/s | palm {hand.palm_size:.0f}px | "
-                 f"tip z {hand.z[8]:+.3f} (wrist-relative)", y + 19, scale=0.38)
-    for position, started, color in game.effects:
-        age = (now - started) / 0.45
-        cv2.circle(frame, pixel(position), int(12 + 40 * age),
-                   tuple(int(c * (1 - age)) for c in color), 2, cv2.LINE_AA)
-    text(frame, f"TELEKINESIS CV   {fps:.0f} FPS", 24, scale=0.55)
-    if not any(hand.points is not None for hand in game.hands):
-        text(frame, "Raise a hand. Aim at a crystal, then pinch.", 54)
-    if now < game.message_until:
-        text(frame, game.message, 78, color=(130, 250, 255), scale=0.43)
-    elif not debug:
-        text(frame, "Pinch + move + release to throw | Two pinches: resize / rotate", 78, scale=0.40)
-    if debug:
-        text(frame, f"dt {dt * 1000:.1f}ms | infer {inference_ms:.1f}ms | "
-             f"smoothing {game.smoothing * 1000:.0f}ms", 96, scale=0.40)
-        text(frame, f"Pinch <= {game.pinch_threshold:.2f} | release >= {game.release_threshold:.2f}",
-             113, scale=0.40)
-    text(frame, f"R reset  G gravity  A palm/fist {'ON' if game.advanced else 'OFF'}  "
-         f"Z depth cue {'ON' if game.depth else 'OFF'}", frame.shape[0] - 34, scale=0.40)
-    text(frame, "F fullscreen  D debug  L skeleton  [ / ] smoothing  Q quit", frame.shape[0] - 13, scale=0.40)
+        f"Cannot read webcam {index}. Close other camera apps, check the privacy shutter and "
+        "Windows Settings > Privacy & security > Camera. Try --camera 1 or --backend msmf.")
 
 
 def run(args):
-    tracker = camera = None
-    count = detected = 0
-    inference_total = capture_total = 0.0
-    timestamps = deque(maxlen=31)
-    debug, landmarks = args.debug, True
-    fullscreen = False
+    tracker = tracker2 = camera = worker = person_model = app = None
+    frames = hand_frames = 0
+    stamps = deque(maxlen=31)
+    stage = deque(maxlen=60)
     started = None
-    game = None
-    next_report = 5.0
-    gravity = args.gravity
     try:
-        tracker = HandTracker(num_hands=args.hands)
+        tracker = HandTracker(num_hands=1 if args.hands != "2" else 2)
+        # MediaPipe re-runs its palm detector on every frame while it sees fewer hands than
+        # num_hands (measured ~60-125 ms here vs ~20 ms while tracking one hand). So track
+        # one hand while pointing, and switch to two only while an object is held.
+        tracker2 = HandTracker(num_hands=2) if args.hands == "auto" else None
+        if not args.no_person:
+            try:
+                person_model = PersonSegmenter()
+            except Exception as error:     # occlusion degrades to "off", app keeps running
+                print(f"Person segmentation unavailable ({error}); occlusion disabled.", file=sys.stderr)
         camera, frame = open_camera(args.camera, args.backend)
         height, width = frame.shape[:2]
-        # Keep the virtual floor high enough to aim a finger at resting crystals
-        # while the wrist is still visible to the camera.
-        arena_height = height - 110
-        objects = spawn_objects(width, arena_height)[:args.objects]
-        game = Interaction(objects, width, arena_height, args.smoothing_ms / 1000,
-                           args.pinch_threshold, args.release_threshold, args.throw_gain)
-        game.advanced, game.depth = args.advanced, args.depth
+        if height < 240 or width < 360:
+            raise RuntimeError("Camera must deliver at least 360x240 pixels.")
+        worker = SegmentationWorker(args.model_dir, args.threads)
+        worker.warm_up()
+        app = App(width, height, worker, args)
+        if person_model is None:
+            app.occlusion = "off"
+        fullscreen = False
         if not args.headless:
             window_size = create_window(width, height)
+            cv2.setMouseCallback(WINDOW, app.on_mouse)
         started = previous = time.perf_counter()
+        app.started_wall = started
+        next_report = 5.0
         while True:
             captured = time.perf_counter()
             dt, now = captured - previous, captured - started
             previous = captured
-            # Mirror first: model and interaction share displayed coordinates.
+            # Mirror FIRST: landmarks, prompts, masks and display all share this one
+            # coordinate system, so the image behaves like a mirror for the user.
             frame = cv2.flip(frame, 1)
-            observations = tracker.detect_all(frame, captured)
-            inference_ms = (time.perf_counter() - captured) * 1000
-            inference_total += inference_ms
-            detected += bool(observations)
-            game.update(observations, now, dt)
-            step_physics(objects, dt, width, arena_height, gravity,
-                         args.restitution, args.damping, args.friction)
-            timestamps.append(time.perf_counter())
-            fps = ((len(timestamps) - 1) / (timestamps[-1] - timestamps[0])
-                   if len(timestamps) > 1 else 0.0)
-            draw_scene(frame, game, now, fps, debug, landmarks, inference_ms, dt)
-            count += 1
+            t0 = time.perf_counter()
+            holding = any(o.holders for o in app.manip.objects)
+            active_tracker = tracker2 if tracker2 is not None and holding else tracker
+            observations = active_tracker.detect_all(frame, captured)
+            t1 = time.perf_counter()
+            timing = {"person": 0.0}
+
+            def segment_person(frame=frame, captured=captured):
+                started_seg = time.perf_counter()
+                mask = person_model.segment(frame, captured) if person_model else None
+                timing["person"] = (time.perf_counter() - started_seg) * 1e3
+                return mask
+
+            out = app.step(frame, now, dt, observations, segment_person)
+            t3 = time.perf_counter()
+            t2 = t1 + timing["person"] / 1e3
+            app.two_hand_mode = active_tracker is tracker2
+            hand_frames += bool(observations)
+            stamps.append(t3)
+            app.fps = (len(stamps) - 1) / (stamps[-1] - stamps[0]) if len(stamps) > 1 else 0.0
+            app.hands_ms, app.person_ms = (t1 - t0) * 1e3, timing["person"]
+            app.app_ms = (t3 - t1) * 1e3 - timing["person"]
+            app.frame_ms = (t3 - captured) * 1e3
+            stage.append((app.hands_ms, app.person_ms, app.app_ms, app.frame_ms))
+            frames += 1
             if now >= next_report:
-                print(f"Live: {fps:.1f} FPS; {len(observations)} hands; "
-                      f"interactions {game.stats}", flush=True)
+                avg = np.mean(stage, axis=0)
+                print(f"Live {app.fps:.1f} FPS | hands{'x2' if app.two_hand_mode else ''} {avg[0]:.0f} ms person {avg[1]:.0f} ms "
+                      f"app {avg[2]:.0f} ms (frame {avg[3]:.0f} ms) | hands seen {len(observations)} | "
+                      f"objects {len(app.manip.objects)} | model ready {worker.model is not None}", flush=True)
                 next_report = now + 5
             if not args.headless:
-                cv2.imshow(WINDOW, frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q"), ord("Q")):
-                    break
-                if key in (ord("f"), ord("F")):
-                    fullscreen = not fullscreen
-                    cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN,
-                                          cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
-                    if not fullscreen:
-                        cv2.resizeWindow(WINDOW, *window_size)
-                if key in (ord("d"), ord("D")):
-                    debug = not debug
-                if key in (ord("l"), ord("L")):
-                    landmarks = not landmarks
-                if key == ord("["):
-                    game.smoothing = max(0, round(game.smoothing - 0.005, 3))
-                if key == ord("]"):
-                    game.smoothing = min(0.15, round(game.smoothing + 0.005, 3))
-                if key in (ord("g"), ord("G")):
-                    gravity = 0 if gravity else args.gravity
-                    game.event(f"Gravity {'ON' if gravity else 'OFF'}", np.array([width / 2, 90]), now)
-                if key in (ord("a"), ord("A")):
-                    game.advanced = not game.advanced
-                    game.event("Palm push / fist freeze " + ("ON" if game.advanced else "OFF"),
-                               np.array([width / 2, 90]), now)
-                if key in (ord("z"), ord("Z")):
-                    game.toggle_depth()
-                    game.event("Relative depth cue " + ("ON" if game.depth else "OFF"),
-                               np.array([width / 2, 90]), now)
-                if key in (ord("r"), ord("R")):
-                    advanced, depth, smoothing = game.advanced, game.depth, game.smoothing
-                    objects = spawn_objects(width, arena_height)[:args.objects]
-                    game = Interaction(objects, width, arena_height, smoothing,
-                                       args.pinch_threshold, args.release_threshold, args.throw_gain)
-                    game.advanced, game.depth = advanced, depth
-                    game.event("Crystals reset", np.array([width / 2, 90]), now)
+                cv2.imshow(WINDOW, out)
+                key = cv2.waitKeyEx(1)
+                if key != -1:
+                    key &= 0xFF
+                    if key in (ord("q"), ord("Q")):
+                        break
+                    if key in (ord("f"), ord("F")):
+                        fullscreen = not fullscreen
+                        cv2.setWindowProperty(WINDOW, cv2.WND_PROP_FULLSCREEN,
+                                              cv2.WINDOW_FULLSCREEN if fullscreen else cv2.WINDOW_NORMAL)
+                        if not fullscreen:
+                            cv2.resizeWindow(WINDOW, *window_size)
+                    else:
+                        app.key(key, now)
                 if cv2.getWindowProperty(WINDOW, cv2.WND_PROP_VISIBLE) < 1:
                     break
             if args.seconds and time.perf_counter() - started >= args.seconds:
                 break
-            read_started = time.perf_counter()
             ok, frame = camera.read()
-            capture_total += (time.perf_counter() - read_started) * 1000
             if not ok or frame is None or not frame.size:
                 raise RuntimeError("Webcam stopped delivering frames. Reconnect it and restart.")
     finally:
@@ -240,48 +755,52 @@ def run(args):
             camera.release()
         if tracker is not None:
             tracker.close()
+        if tracker2 is not None:
+            tracker2.close()
+        if person_model is not None:
+            person_model.close()
         cv2.destroyAllWindows()
-        if started is not None and count:
-            elapsed = finished - started
-            print(f"Run: {count} frames / {elapsed:.2f}s = {count / elapsed:.1f} FPS; "
-                  f"hand detected in {detected} frames.", flush=True)
-            print(f"Mean inference: {inference_total / count:.1f} ms; "
-                  f"mean camera read: {capture_total / max(count - 1, 1):.1f} ms.", flush=True)
-            print(f"Interactions since last reset: {game.stats}", flush=True)
+        if app is not None:
+            app.close()
+        if worker is not None:
+            worker.close()
+        if started is not None and frames:
+            print(f"Run: {frames} frames / {finished - started:.1f}s = {frames / (finished - started):.1f} FPS; "
+                  f"hands in {hand_frames} frames; "
+                  f"{app.counters if app else ''}; manipulation {app.manip.stats if app else ''}", flush=True)
+        print(f"Shutdown complete in {time.perf_counter() - finished:.2f}s", flush=True)
 
 
-def parse_args():
+def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--backend", choices=("auto", "dshow", "msmf"), default="auto")
-    parser.add_argument("--hands", type=int, choices=(1, 2), default=2)
-    parser.add_argument("--objects", type=int, choices=(1, 2, 3, 4), default=4)
     parser.add_argument("--debug", action="store_true")
-    parser.add_argument("--advanced", action="store_true", help="Enable palm push / fist freeze")
-    parser.add_argument("--depth", action="store_true", help="Experimental apparent-size depth cue")
-    parser.add_argument("--smoothing-ms", type=float, default=35.0)
-    parser.add_argument("--pinch-threshold", type=float, default=0.30)
-    parser.add_argument("--release-threshold", type=float, default=0.45)
-    parser.add_argument("--throw-gain", type=float, default=1.25)
-    parser.add_argument("--gravity", type=float, default=650.0, help="Pixels/s^2")
-    parser.add_argument("--restitution", type=float, default=0.72)
-    parser.add_argument("--damping", type=float, default=0.18, help="Air drag per second")
-    parser.add_argument("--friction", type=float, default=4.0, help="Floor drag per second")
-    parser.add_argument("--seconds", type=float, default=0, help="Optional timed run")
-    parser.add_argument("--headless", action="store_true", help="Camera/inference smoke test")
-    args = parser.parse_args()
-    numeric = (args.smoothing_ms, args.pinch_threshold, args.release_threshold,
-               args.throw_gain, args.gravity, args.restitution, args.damping, args.friction, args.seconds)
-    if not all(math.isfinite(v) for v in numeric):
-        parser.error("All numeric settings must be finite.")
+    parser.add_argument("--pinch-threshold", type=float, default=.30)
+    parser.add_argument("--release-threshold", type=float, default=.45)
+    parser.add_argument("--min-scale", type=float, default=.25)
+    parser.add_argument("--max-scale", type=float, default=4.0)
+    parser.add_argument("--max-area", type=float, default=.30,
+                        help="largest plausible object as a fraction of the frame")
+    parser.add_argument("--model-dir", default=str(MODEL_DIR))
+    parser.add_argument("--threads", type=int, choices=range(1, 9), default=4)
+    parser.add_argument("--no-person", action="store_true", help="disable person segmentation/occlusion")
+    parser.add_argument("--hands", choices=("auto", "1", "2"), default="auto",
+                        help="auto: track 1 hand, 2 only while holding (faster)")
+    parser.add_argument("--seconds", type=float, default=0)
+    parser.add_argument("--headless", action="store_true")
+    args = parser.parse_args(argv)
+    values = (args.pinch_threshold, args.release_threshold, args.min_scale, args.max_scale, args.max_area, args.seconds)
+    if not all(math.isfinite(v) for v in values):
+        parser.error("Numeric settings must be finite.")
     if not 0 < args.pinch_threshold < args.release_threshold:
         parser.error("Thresholds must satisfy 0 < pinch < release.")
-    if not 0 <= args.smoothing_ms <= 150:
-        parser.error("--smoothing-ms must be between 0 and 150.")
-    if not 0 <= args.restitution <= 1 or min(args.throw_gain, args.gravity, args.damping, args.friction) < 0:
-        parser.error("Restitution must be 0-1; physics settings must be nonnegative.")
+    if not 0 < args.min_scale <= 1 <= args.max_scale:
+        parser.error("Scale bounds must satisfy 0 < min <= 1 <= max.")
+    if not 0 < args.max_area <= 1:
+        parser.error("--max-area must be in (0, 1].")
     if args.seconds < 0 or (args.headless and args.seconds <= 0):
-        parser.error("Use a positive --seconds duration for --headless.")
+        parser.error("Headless runs require a positive --seconds duration.")
     return args
 
 
