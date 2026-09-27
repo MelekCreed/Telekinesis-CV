@@ -1,0 +1,31 @@
+# Python environments, bytecode, and local tooling
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+
+# Downloaded model (fetched automatically on first run)
+*.task
+*.download
+
+# Local logs, recordings, and credentials
+*.log
+*.mp4
+*.avi
+*.mov
+.env
+.env.*
+*.pem
+*.key
+credentials*.json
+secrets*.json
+Thumbs.db
+.DS_Store
