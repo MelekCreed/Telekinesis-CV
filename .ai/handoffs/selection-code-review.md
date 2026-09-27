@@ -1,0 +1,9 @@
+Recommend fixing shutdown responsiveness and acquisition dwell continuity; all 30 tests passed in this read-only review, and focused reproductions confirmed both behaviors. Prefer bounded cancellation and timer resets over abandoning executor threads or counting camera gaps as observed stability. Live GUI behavior, physical pointing, and hand-occlusion accuracy remain unverified.
+
+Full review comments:
+
+- [P2] Bound or cancel running model preparation when quitting — C:/Users/moall/OneDrive/Desktop/Projects/telekinisis/segmentation.py:170-172
+  If Q is pressed during first-use model downloading or encoding, the window closes but shutdown blocks until the entire running job finishes. `cancel_futures=True` cannot cancel running work, and the download's 60-second timeout applies to individual network operations rather than total duration. Consequently, quitting or completing a timed smoke test can leave the process running for minutes. Add bounded preparation and cooperative cancellation, including a cancellation check before starting inference; changing only `wait=False` would still leave executor threads blocking interpreter exit.
+
+- [P2] Reset acquisition dwell timers after camera gaps — C:/Users/moall/OneDrive/Desktop/Projects/telekinisis/main.py:141-143
+  When a frame gap exceeds 250 ms, this branch resets gesture and verification evidence but preserves `stable_since` and `selection.aim_since`. A mocked frame-loop reproduction captures a reference from just two observations one second apart; similarly, an unsent aim submits immediately on the first frame after that gap. This counts unobserved time toward the required hand-free stability and stationary-point dwell. Restart those acquisition timers after a gap so intermittent camera stalls cannot bypass either dwell requirement.

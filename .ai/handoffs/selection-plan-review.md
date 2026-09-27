@@ -1,0 +1,23 @@
+**Recommendation:** proceed with SlimSAM ONNX CPU for this milestone, gated by an offline preprocessing check and measured responsiveness. The encoder/decoder split and three-mask output fit the proposal. [Model documentation](https://huggingface.co/Xenova/slimsam-77-uniform)
+
+Read AI_TEAM.md and the five relevant files. No files modified, agents invoked, or webcam accessed. HEAD is `f0ce5e8`; the working tree also contains untracked coordination files.
+
+- **Selection UX:** use explicit states: capture reference → encode → aim → preview → confirm. Capture an untouched, mirrored frame before drawing overlays, after a short hand-free, stable interval. Show “Keep camera and objects still,” the submitted prompt dot, and a small reference preview beside the live overlay. Start with one controlling hand. Allow a keyboard action to cycle the cached candidates and another to recapture.
+
+- **Confirmation:** existing `Interaction.update()` fires `pressed` on the first closing frame; reuse its geometry helpers, not that confirmation behavior. Suggested starting values: ~300 ms stable aim, then ~200 ms sustained pinch after the preview is visible and an open hand has armed confirmation. Freeze the exact candidate identity during that gesture; reset dwell on candidate change, tracking loss, reference invalidation, or long frame gaps. **Do not time only the hysteresis-latched boolean:** one noisy low reading followed by readings in the hysteresis band could otherwise confirm. Require sustained closing evidence, with a deliberate release before rearming.
+
+- **Freshness:** tag each request/result with reference generation and prompt generation; separately version candidate selection. Use one running job plus one replaceable pending request—no growing executor queue. Cache embeddings per reference and masks per prompt. Reject obsolete completions and invalidate visible previews immediately when their prompt/reference becomes invalid. Workers receive immutable image copies; the main thread owns display and selection state.
+
+- **Scene-change risk:** whole-frame differences will react to the pointing hand; excluding a generous hand region avoids that but creates a blind spot. Compare visible background and visible target regions, tolerate small illumination changes, and hide/block uncertain previews. Object motion underneath an occluding hand cannot be reliably detected. If strict freshness is required, make pinch request confirmation and finalize only after the hand clears enough of the target to validate it. Avoid adding registration or object tracking here.
+
+- **Preprocessing:** pin the exact ONNX artifacts and inspect their input/output names, shapes, and dtypes. Preserve one coordinate system: mirrored camera pixels → aspect-preserving resize → model padding. Match the export’s RGB conversion, normalization, resize rounding, point scaling, and mask postprocessing. Remove padding before restoring original dimensions; threshold restored logits appropriately. Test non-square images and edge prompts. Do not assume another SAM export’s tensor contract applies.
+
+- **Mask quality and performance:** reject empty, implausibly tiny, and near-whole-frame masks; check prompt containment. Rank plausible candidates by model score, but let the user inspect alternatives—score does not establish intended object extent. A background worker still competes with MediaPipe: begin with a small ORT thread count and benchmark encoder and decoder separately. ORT defaults can use all physical cores, with spinning enabled. [Threading documentation](https://onnxruntime.ai/docs/performance/tune-performance/threading.html)
+
+**Scope:** remove active crystal spawning, drawing, physics updates, and obsolete controls; retain reusable tracking helpers and leave dormant physics code alone. Confirmation should only retain and visibly mark the selected silhouette. Defer extraction, dragging, inpainting, physics, and two-hand manipulation.
+
+**Alternatives considered:** live-frame segmentation retains fingertip occlusion; automatic registration expands scope substantially; mouse prompting is useful as an offline diagnostic.
+
+**Acceptance checks:** coordinate restoration, delayed stale results, candidate switches during dwell, single-frame pinch noise, tracking gaps, and scene invalidation. Existing tests do not cover these.
+
+**Confidence:** high in the state/freshness design; moderate in segmentation quality; CPU latency and Python 3.13 runtime compatibility remain unverified.
