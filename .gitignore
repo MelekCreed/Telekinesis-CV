@@ -15,6 +15,7 @@ htmlcov/
 # Downloaded model (fetched automatically on first run)
 *.task
 *.download
+models/
 
 # Local logs, recordings, and credentials
 *.log
